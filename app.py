@@ -1,4 +1,4 @@
-# app_array.py (updated to handle SELECT * without INTO / implicit work area)
+# app_array.py (fixed: robust INTO detection + correct used-field discovery)
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Tuple, Set
@@ -7,22 +7,29 @@ import json
 
 app = FastAPI(title="ABAP SELECT* Analyzer/Remediator (Array JSON, ECC)")
 
-# ---------- ECC-safe regex helpers ----------
-# INTO clause is now OPTIONAL (handles implicit work area SELECT * ... .)
+# ---------- Robust SELECT * detector ----------
+# Handles:
+#   SELECT * FROM mara INTO wa WHERE ...
+#   SELECT * FROM mara WHERE ... INTO wa.
+#   SELECT SINGLE * FROM mara INTO wa WHERE ...
+#   SELECT * FROM mara WHERE ... INTO TABLE itab.
+#   Newlines anywhere; trailing dot required.
 SELECT_STAR_RE = re.compile(
-    r"""(?P<full>
-            SELECT\s+(?:SINGLE\s+)?\*\s+FROM\s+(?P<table>\w+)
-            (?P<middle>.*?)
-            (?:
-                (?:INTO\s+TABLE\s+(?P<into_tab>\w+)) |
-                (?:INTO\s+(?P<into_wa>\w+))
-            )?
-            (?P<tail>.*?)
-        )\.
+    r"""
+    (?P<full>
+      SELECT\s+(?:SINGLE\s+)?\*\s+FROM\s+(?P<table>\w+)
+      (?P<body>.*?)
+      \.
+    )
     """,
     re.IGNORECASE | re.DOTALL | re.VERBOSE,
 )
 
+# INTO variants anywhere inside the statement body
+INTO_TABLE_RE = re.compile(r"\bINTO\s+TABLE\s+(?P<name>\w+)\b", re.IGNORECASE)
+INTO_WA_RE    = re.compile(r"\bINTO\s+(?!TABLE\b)(?P<name>\w+)\b", re.IGNORECASE)
+
+# Loops/reads/assigns to discover aliases (itab -> wa or <fs>)
 LOOP_INTO_RE         = re.compile(r"LOOP\s+AT\s+(?P<itab>\w+)\s+INTO\s+(?P<wa>\w+)\s*\.", re.IGNORECASE)
 LOOP_ASSIGNING_RE    = re.compile(r"LOOP\s+AT\s+(?P<itab>\w+)\s+ASSIGNING\s+<(?P<fs>\w+)>\s*\.", re.IGNORECASE)
 READ_TABLE_INTO_RE   = re.compile(r"READ\s+TABLE\s+(?P<itab>\w+)[^\.]*\s+INTO\s+(?P<wa>\w+)\s*\.", re.IGNORECASE)
@@ -32,7 +39,6 @@ HEADER_LINE_LOOP_RE  = re.compile(r"LOOP\s+AT\s+(?P<itab>\w+)\s*\.", re.IGNORECA
 
 STRUCT_FIELD_RE_TMPL = r"(?<![A-Za-z0-9_]){name}-(?P<field>[A-Za-z0-9_]+)(?![A-Za-z0-9_])"
 
-# ---------- models ----------
 class Unit(BaseModel):
     pgm_name: str
     inc_name: str
@@ -43,32 +49,35 @@ class Unit(BaseModel):
     end_line: Optional[int] = None
     code: Optional[str] = ""
 
-# ---------- core logic ----------
 def find_selects(txt: str):
     out = []
     for m in SELECT_STAR_RE.finditer(txt):
-        into_tab = m.group("into_tab")
-        into_wa  = m.group("into_wa")
-        if into_tab:
-            target_type = "itab"
-            target_name = into_tab
-        elif into_wa:
-            target_type = "wa"
-            target_name = into_wa
+        full = m.group("full")
+        table = m.group("table")
+        body  = m.group("body")  # includes everything up to the trailing dot
+        # Try to find INTO anywhere in the body (before the trailing dot)
+        mi_tab = INTO_TABLE_RE.search(body)
+        mi_wa  = INTO_WA_RE.search(body) if not mi_tab else None
+
+        if mi_tab:
+            tgt_type = "itab"; tgt_name = mi_tab.group("name")
+        elif mi_wa:
+            tgt_type = "wa";   tgt_name = mi_wa.group("name")
         else:
-            # No INTO -> implicit work area: table name is the "owner"
-            target_type = "implicit"
-            target_name = m.group("table")
+            # No INTO at all -> implicit (table header line or later INTO not found)
+            tgt_type = "implicit"; tgt_name = table
+
         out.append({
-            "text": m.group("full"),
-            "table": m.group("table"),
-            "target_type": target_type,
-            "target_name": target_name,
+            "text": full,
+            "table": table,
+            "target_type": tgt_type,
+            "target_name": tgt_name,
             "span": m.span(0),
         })
     return out
 
 def build_aliases(source: str) -> Dict[str, Set[str]]:
+    """Map itab -> {wa, <fs>, header-line name} for field-usage harvesting."""
     aliases: Dict[str, Set[str]] = {}
     def add(owner, alias): aliases.setdefault(owner, set()).add(alias)
 
@@ -77,71 +86,96 @@ def build_aliases(source: str) -> Dict[str, Set[str]]:
     for m in READ_TABLE_INTO_RE.finditer(source):      add(m.group("itab"), m.group("wa"))
     for m in READ_TABLE_ASSIGNING_RE.finditer(source): add(m.group("itab"), f"<{m.group('fs')}>")
     for m in ASSIGN_FS_ITAB_RE.finditer(source):       add(m.group("itab"), f"<{m.group('fs')}>")
-    for m in HEADER_LINE_LOOP_RE.finditer(source):     add(m.group("itab"), m.group("itab"))  # header line as WA
+    for m in HEADER_LINE_LOOP_RE.finditer(source):     add(m.group("itab"), m.group("itab"))  # header-line as WA
 
     return aliases
 
-def collect_used_fields(source: str, target_type: str, target_name: str, aliases: Dict[str, Set[str]]):
+def collect_used_fields(flat_source: str,
+                        select_stmt_text: str,
+                        table: str,
+                        target_type: str,
+                        target_name: str,
+                        aliases: Dict[str, Set[str]]) -> Tuple[Set[str], bool]:
     """
-    - itab/wa: search target and its aliases (wa, <fs>) for <name>-field references.
-    - implicit: search the TABLE name as the owner (e.g., MARA-field)
+    Only collect fields that are dereferenced on the SELECT target (e.g., wa-bukrs, itab-belnr, <fs>-field).
+    We do NOT collect tokens merely because they appear in WHERE.
     """
     names: Set[str] = set()
+    ambiguous = False
+
     if target_type == "implicit":
-        names = {target_name}
-    else:
-        names = {target_name}
-        if target_type == "itab" and target_name in aliases:
-            names |= aliases[target_name]
+        # If implicit, the "target" is effectively the table header line name.
+        names.add(table)
+    elif target_type == "itab":
+        names.add(target_name)
+        names |= aliases.get(target_name, set())
+    else:  # wa
+        names.add(target_name)
 
-    fields, ambiguous = set(), False
-
-    # Ambiguity when using ASSIGN COMPONENT ... OF STRUCTURE <var or <fs>>
-    if target_type != "implicit" and re.search(r"ASSIGN\s+COMPONENT\s+\w+\s+OF\s+STRUCTURE\s+" + re.escape(target_name), source, re.IGNORECASE):
-        ambiguous = True
-    if target_type == "itab" and re.search(r"ASSIGN\s+COMPONENT\s+\w+\s+OF\s+STRUCTURE\s+<\w+>", source, re.IGNORECASE):
-        ambiguous = True
-
+    # Heuristic: if ASSIGN COMPONENT OF STRUCTURE is used for any of our names, we mark ambiguous
     for n in names:
-        patt = re.compile(STRUCT_FIELD_RE_TMPL.format(name=re.escape(n)), re.IGNORECASE)
-        for m in patt.finditer(source):
+        patt = re.compile(r"ASSIGN\s+COMPONENT\s+\w+\s+OF\s+STRUCTURE\s+" + re.escape(n) + r"\b", re.IGNORECASE)
+        if patt.search(flat_source):
+            ambiguous = True
+            break
+
+    fields: Set[str] = set()
+    for n in names:
+        patt = re.compile(STRUCT_FIELD_RE_TMPL.format(name=re.escape(n)))
+        for m in patt.finditer(flat_source):
             fields.add(m.group("field").lower())
 
     return fields, ambiguous
 
-def build_replacement_stmt(sel_text: str, table: str, fields: List[str], target_type: str, target_name: str) -> str:
-    # Replace '*' in the original SELECT with explicit field list; keep rest intact
+def build_replacement_stmt(sel_text: str,
+                           table: str,
+                           fields: List[str],
+                           target_type: str,
+                           target_name: str) -> str:
+    """
+    Replace the '*' with explicit fields, keep WHERE/other clauses, and
+    turn INTO into 'INTO CORRESPONDING FIELDS OF ...'.
+    Works regardless of WHERE vs INTO order.
+    """
+    # 1) Extract head "SELECT ... FROM <table>"
     head_m = re.search(r"SELECT\s+(?:SINGLE\s+)?\*\s+FROM\s+\w+", sel_text, re.IGNORECASE)
     if not head_m:
-        return sel_text  # fallback
-
-    explicit_list = " ".join(sorted(fields))
+        return sel_text  # safety
     head = head_m.group(0)
-    head_repl = re.sub(r"\*", explicit_list, head, count=1)
 
-    # If there was an INTO, normalize to CORRESPONDING FIELDS
-    if target_type in ("itab", "wa"):
-        into_clause = (f"INTO CORRESPONDING FIELDS OF TABLE {target_name}"
-                       if target_type == "itab"
-                       else f"INTO CORRESPONDING FIELDS OF {target_name}")
-        # Replace any existing INTO... with the normalized INTO, or append one if missing
-        if re.search(r"\bINTO\b", sel_text, re.IGNORECASE):
-            sel_text_no_head = sel_text[len(head):]
-            sel_text_no_head = re.sub(
-                r"(?:INTO\s+TABLE\s+\w+|INTO\s+\w+)",
-                into_clause,
-                sel_text_no_head,
-                flags=re.IGNORECASE
-            )
-            return head_repl + sel_text_no_head
+    # 2) Replace '*' with explicit list
+    explicit = " ".join(sorted(fields)) if fields else "*"
+    head = re.sub(r"\*", explicit, head, count=1)
+
+    # 3) Grab the body AFTER the head (WHERE, INTO, etc.) up to the final dot
+    body = sel_text[head_m.end():]
+    if body.endswith("."):
+        body = body[:-1]
+
+    # 4) Normalize INTO to CORRESPONDING FIELDS
+    if target_type == "itab":
+        into_cf = f"INTO CORRESPONDING FIELDS OF TABLE {target_name}"
+    elif target_type == "wa":
+        into_cf = f"INTO CORRESPONDING FIELDS OF {target_name}"
+    else:  # implicit
+        # no INTO present originally; we don't force one
+        into_cf = None
+
+    # Remove any existing INTO … (table or wa)
+    body_wo_into = INTO_TABLE_RE.sub("", body)
+    body_wo_into = INTO_WA_RE.sub("", body_wo_into)
+
+    # Make a tidy body: keep WHERE etc., then add standardized INTO (if any)
+    parts = body_wo_into.strip()
+    if into_cf:
+        # Put INTO after WHERE/order-by/etc. (ABAP allows either side)
+        if parts:
+            stmt = f"{head}{parts}\n  {into_cf}."
         else:
-            # No INTO present, add one before the final '.'
-            body = sel_text[len(head):-1]  # strip trailing '.'
-            return f"{head_repl}{body} {into_clause}."
+            stmt = f"{head}\n  {into_cf}."
     else:
-        # implicit: keep the statement style (no INTO). Just swap the star.
-        body = sel_text[len(head):]
-        return head_repl + body
+        stmt = f"{head}{parts}."
+    return stmt
 
 def apply_span_replacements(source: str, repls: List[Tuple[Tuple[int,int], str]]) -> str:
     out = source
@@ -152,7 +186,6 @@ def apply_span_replacements(source: str, repls: List[Tuple[Tuple[int,int], str]]
 def concat_units(units: List[Unit]) -> str:
     return "".join((u.code or "") + "\n" for u in units)
 
-# ---------- endpoints ----------
 @app.post("/analyze-array")
 def analyze_array(units: List[Unit]):
     flat_source = concat_units(units)
@@ -164,15 +197,12 @@ def analyze_array(units: List[Unit]):
         selects = find_selects(src)
         sel_results = []
         for sel in selects:
-            used, ambiguous = collect_used_fields(
-                flat_source, sel["target_type"], sel["target_name"], aliases
-            )
+            used, ambiguous = collect_used_fields(flat_source, sel["text"], sel["table"],
+                                                 sel["target_type"], sel["target_name"], aliases)
             suggested_fields = sorted(used) if used and not ambiguous else None
             suggested_stmt = (
-                build_replacement_stmt(
-                    sel["text"], sel["table"], suggested_fields,
-                    sel["target_type"], sel["target_name"]
-                )
+                build_replacement_stmt(sel["text"], sel["table"], suggested_fields,
+                                       sel["target_type"], sel["target_name"])
                 if suggested_fields else None
             )
             sel_results.append({
@@ -202,14 +232,11 @@ def remediate_array(units: List[Unit]):
         selects = find_selects(src)
         replacements = []
         for sel in selects:
-            used, ambiguous = collect_used_fields(
-                flat_source, sel["target_type"], sel["target_name"], aliases
-            )
+            used, ambiguous = collect_used_fields(flat_source, sel["text"], sel["table"],
+                                                 sel["target_type"], sel["target_name"], aliases)
             if used and not ambiguous:
-                new_stmt = build_replacement_stmt(
-                    sel["text"], sel["table"], sorted(used),
-                    sel["target_type"], sel["target_name"]
-                )
+                new_stmt = build_replacement_stmt(sel["text"], sel["table"], sorted(used),
+                                                  sel["target_type"], sel["target_name"])
                 replacements.append((sel["span"], new_stmt))
         remediated = apply_span_replacements(src, replacements)
         obj = json.loads(u.model_dump_json())
